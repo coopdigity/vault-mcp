@@ -1,20 +1,48 @@
 export class VaultClient {
   private baseUrl: string;
-  private token: string;
+  private token: string = "";
+  private username: string;
+  private password: string;
 
   constructor() {
     const url = process.env.VAULT_ADDR;
-    const token = process.env.VAULT_TOKEN;
+    const username = process.env.VAULT_USERNAME;
+    const password = process.env.VAULT_PASSWORD;
 
-    if (!url || !token) {
-      throw new Error("VAULT_ADDR and VAULT_TOKEN must be set");
+    if (!url || !username || !password) {
+      throw new Error("VAULT_ADDR, VAULT_USERNAME, and VAULT_PASSWORD must be set");
     }
 
     this.baseUrl = url.replace(/\/+$/, "");
-    this.token = token;
+    this.username = username;
+    this.password = password;
+  }
+
+  async login(): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/v1/auth/userpass/login/${this.username}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: this.password }),
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`Vault login failed (${res.status}): ${body.slice(0, 500)}`);
+    }
+
+    const data = (await res.json()) as { auth: { client_token: string; lease_duration: number } };
+    this.token = data.auth.client_token;
+  }
+
+  private async ensureAuthenticated(): Promise<void> {
+    if (!this.token) {
+      await this.login();
+    }
   }
 
   private async request(path: string, options: RequestInit = {}): Promise<Response> {
+    await this.ensureAuthenticated();
+
     const res = await fetch(`${this.baseUrl}${path}`, {
       ...options,
       headers: {
@@ -22,6 +50,23 @@ export class VaultClient {
         ...(options.headers as Record<string, string>),
       },
     });
+
+    // Re-authenticate on 403 (token expired) and retry once
+    if (res.status === 403) {
+      await this.login();
+      const retry = await fetch(`${this.baseUrl}${path}`, {
+        ...options,
+        headers: {
+          "X-Vault-Token": this.token,
+          ...(options.headers as Record<string, string>),
+        },
+      });
+      if (!retry.ok) {
+        const body = await retry.text().catch(() => "");
+        throw new Error(`Vault ${retry.status}: ${body.slice(0, 500)}`);
+      }
+      return retry;
+    }
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
